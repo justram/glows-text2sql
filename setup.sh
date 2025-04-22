@@ -9,7 +9,9 @@ set -euo pipefail
 ### ───── Configurable knobs ───────────────────────────────────
 PY_VERSION="3.12"                         # Python version for the venv
 MODEL_TAG="gemma3:27b-it-qat"             # Ollama model to pull/run
-PROJECT_DIR="${PROJECT_DIR:-$HOME/text2sql-workshop}" # Updated project dir name
+# Determine the script's directory and use it as the project root
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+PROJECT_DIR="${PROJECT_DIR:-$SCRIPT_DIR}" # Use script dir as default project dir
 VENV_DIR="$PROJECT_DIR/.venv"
 # REQUIREMENTS_FILE="requirements.in"        # Removed, using pyproject.toml
 ### ────────────────────────────────────────────────────────────
