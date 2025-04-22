@@ -2,7 +2,7 @@ import csv
 import json
 import logging  # Added logging
 from io import StringIO
-from typing import Any, Dict, List, Optional, TextIO  # Added typing, TextIO
+from typing import Any, Dict, List, Optional, TextIO  # Added typing, TextIO, cast
 
 import click  # Import click
 import instructor
@@ -14,6 +14,7 @@ JSON_FILE_PATH = "data/dev_20240627/dev_tables.json"
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 OLLAMA_API_KEY = "ollama"  # Required, but unused by Ollama
 OLLAMA_MODEL = "gemma3:27b-it-qat"
+ENDPOINT_TYPE = "ollama"  # Added endpoint type
 LOG_LEVEL = logging.INFO  # Configure log level
 
 # --- Logging Setup ---
@@ -187,17 +188,30 @@ full_name: {table_input.full_name}
 
 
 def process_table(
+    db_id: str,  # Add db_id
     table_name_orig: str,
     table_name_friendly: str,
     schema_csv: str,
-    output_file: TextIO,  # Add output file handle argument
+    output_file: TextIO,  # Output file handle (for JSONL)
     total_tables: int,  # Add total table count
     processed_tables_tracker: List[int],  # Add tracker
 ) -> None:
-    """Processes a single table: creates input, calls LLM, writes summary, and updates progress."""
+    """Processes a single table: creates input, calls LLM, writes JSON line, and updates progress."""
     logging.info(
-        f"  Generating summary for table: {table_name_orig} ({table_name_friendly})"
+        f"  Generating summary for table: {table_name_orig} ({table_name_friendly}) in DB: {db_id}"
     )
+
+    output_record: Dict[str, Any] = {
+        "db_id": db_id,
+        "table_name_original": table_name_orig,
+        "table_name_friendly": table_name_friendly,
+        "schema_csv": schema_csv,
+        "summary": None,
+        "error": None,
+        "model_name": OLLAMA_MODEL,
+        "endpoint_type": ENDPOINT_TYPE,
+    }
+
     table_input = TableSchemaInput(
         table_name=table_name_orig,
         full_name=table_name_friendly,
@@ -206,20 +220,24 @@ def process_table(
 
     summary_output = get_table_summary(table_input)
     if summary_output:
-        # Write to file instead of printing
-        output_file.write(
-            f"--- Summary for {table_name_orig} ({table_name_friendly}) ---\\n"
-        )
-        output_file.write(f"{summary_output.summary}\\n\\n")
+        output_record["summary"] = summary_output.summary
         logging.info(
             f"    Successfully generated and wrote summary for {table_name_orig}."
         )
     else:
-        # Log failure, maybe write a placeholder to file?
-        logging.error(f"    Failed to generate summary for table {table_name_orig}.")
-        output_file.write(
-            f"--- Summary generation FAILED for {table_name_orig} ({table_name_friendly}) ---\\n\\n"
+        error_msg = f"Failed to generate summary for table {table_name_orig}."
+        output_record["error"] = error_msg
+        logging.error(f"    {error_msg}")
+
+    # Write the JSON line to the output file
+    try:
+        json_line = json.dumps(output_record)
+        output_file.write(json_line + "\\n")
+    except (TypeError, OverflowError) as json_err:
+        logging.error(
+            f"    Failed to serialize record to JSON for table {table_name_orig}: {json_err}"
         )
+
     # Update progress counter and log status
     processed_tables_tracker[0] += 1
     current_count = processed_tables_tracker[0]
@@ -235,7 +253,6 @@ def process_database(
     """Processes all tables within a single database schema."""
     db_id = db_schema.get("db_id", "Unknown DB")
     logging.info(f"--- Processing Database: {db_id} ---")
-    output_file.write(f"=== Database: {db_id} ===\\n\\n")  # Write DB header to file
 
     tables_orig = db_schema.get("table_names_original", [])
     tables_friendly = db_schema.get("table_names", [])
@@ -247,9 +264,6 @@ def process_database(
         logging.warning(
             f"Mismatch between original ({len(tables_orig)}) and friendly ({len(tables_friendly)}) table name counts for DB '{db_id}'. Skipping DB."
         )
-        output_file.write(
-            f"*** Error: Mismatched table name counts. Skipping database {db_id}. ***\\n\\n"
-        )
         return
 
     for tbl_idx, table_name_orig in enumerate(tables_orig):
@@ -259,6 +273,7 @@ def process_database(
 
         if schema_csv_str:
             process_table(
+                db_id,  # Pass db_id
                 table_name_orig,
                 table_name_friendly,
                 schema_csv_str,
@@ -270,9 +285,25 @@ def process_database(
             logging.warning(
                 f"Skipping summary generation for table '{table_name_orig}' in DB '{db_id}' due to CSV creation issues."
             )
-            output_file.write(
-                f"*** Error: Could not create schema CSV for table '{table_name_orig}'. Skipping summary generation. ***\\n\\n"
-            )
+            # Write a specific error record for this table
+            error_record = {
+                "db_id": db_id,
+                "table_name_original": table_name_orig,
+                "table_name_friendly": table_name_friendly,
+                "schema_csv": None,
+                "summary": None,
+                "error": f"Could not create schema CSV for table '{table_name_orig}'. Skipping summary generation.",
+                "model_name": OLLAMA_MODEL,
+                "endpoint_type": ENDPOINT_TYPE,
+            }
+            try:
+                json_line = json.dumps(error_record)
+                output_file.write(json_line + "\\n")
+            except (TypeError, OverflowError) as json_err:
+                logging.error(
+                    f"    Failed to serialize CSV error record to JSON for table {table_name_orig}: {json_err}"
+                )
+
             # Also update progress even if skipped/failed at CSV stage
             processed_tables_tracker[0] += 1
             current_count = processed_tables_tracker[0]
@@ -294,7 +325,7 @@ def process_database(
     "--output-file",
     required=True,
     type=click.Path(dir_okay=False, writable=True),
-    help="Path to the output file where summaries will be written.",
+    help="Path to the output JSONL file where summaries will be written.",
 )
 @click.option(
     "--log-level",
