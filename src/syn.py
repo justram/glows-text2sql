@@ -2,8 +2,9 @@ import csv
 import json
 import logging  # Added logging
 from io import StringIO
-from typing import Any, Dict, List, Optional  # Added typing
+from typing import Any, Dict, List, Optional, TextIO  # Added typing, TextIO
 
+import click  # Import click
 import instructor
 import openai
 from pydantic import BaseModel, Field
@@ -12,7 +13,7 @@ from pydantic import BaseModel, Field
 JSON_FILE_PATH = "data/dev_20240627/dev_tables.json"
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 OLLAMA_API_KEY = "ollama"  # Required, but unused by Ollama
-OLLAMA_MODEL = "llama3"
+OLLAMA_MODEL = "gemma3:27b-it-qat"
 LOG_LEVEL = logging.INFO  # Configure log level
 
 # --- Logging Setup ---
@@ -168,6 +169,7 @@ full_name: {table_input.full_name}
 {table_input.schema_csv}"""
 
     try:
+        # Make the request potentially longer timeout if needed for larger models
         response = client.chat.completions.create(
             model=OLLAMA_MODEL,
             messages=[
@@ -175,6 +177,8 @@ full_name: {table_input.full_name}
                 {"role": "user", "content": formatted_input_str},
             ],
             response_model=TableSummary,
+            max_retries=2,  # Optional: Add retries
+            # timeout=120 # Optional: Increase timeout if needed
         )
         return response  # type: ignore
     except Exception as e:
@@ -183,9 +187,14 @@ full_name: {table_input.full_name}
 
 
 def process_table(
-    table_name_orig: str, table_name_friendly: str, schema_csv: str
+    table_name_orig: str,
+    table_name_friendly: str,
+    schema_csv: str,
+    output_file: TextIO,  # Add output file handle argument
+    total_tables: int,  # Add total table count
+    processed_tables_tracker: List[int],  # Add tracker
 ) -> None:
-    """Processes a single table: creates input, calls LLM, and prints summary."""
+    """Processes a single table: creates input, calls LLM, writes summary, and updates progress."""
     logging.info(
         f"  Generating summary for table: {table_name_orig} ({table_name_friendly})"
     )
@@ -197,16 +206,36 @@ def process_table(
 
     summary_output = get_table_summary(table_input)
     if summary_output:
-        print(f"\n    --- Summary for {table_name_orig} ({table_name_friendly}) ---")
-        print(f"    {summary_output.summary}\n")
+        # Write to file instead of printing
+        output_file.write(
+            f"--- Summary for {table_name_orig} ({table_name_friendly}) ---\\n"
+        )
+        output_file.write(f"{summary_output.summary}\\n\\n")
+        logging.info(
+            f"    Successfully generated and wrote summary for {table_name_orig}."
+        )
     else:
-        print(f"    Failed to generate summary for table {table_name_orig}.")
+        # Log failure, maybe write a placeholder to file?
+        logging.error(f"    Failed to generate summary for table {table_name_orig}.")
+        output_file.write(
+            f"--- Summary generation FAILED for {table_name_orig} ({table_name_friendly}) ---\\n\\n"
+        )
+    # Update progress counter and log status
+    processed_tables_tracker[0] += 1
+    current_count = processed_tables_tracker[0]
+    logging.info(f"  Progress: {current_count}/{total_tables} tables processed.")
 
 
-def process_database(db_schema: Dict[str, Any]) -> None:
+def process_database(
+    db_schema: Dict[str, Any],
+    output_file: TextIO,
+    total_tables: int,  # Add total table count
+    processed_tables_tracker: List[int],  # Add tracker
+) -> None:  # Add output file handle
     """Processes all tables within a single database schema."""
     db_id = db_schema.get("db_id", "Unknown DB")
     logging.info(f"--- Processing Database: {db_id} ---")
+    output_file.write(f"=== Database: {db_id} ===\\n\\n")  # Write DB header to file
 
     tables_orig = db_schema.get("table_names_original", [])
     tables_friendly = db_schema.get("table_names", [])
@@ -218,6 +247,9 @@ def process_database(db_schema: Dict[str, Any]) -> None:
         logging.warning(
             f"Mismatch between original ({len(tables_orig)}) and friendly ({len(tables_friendly)}) table name counts for DB '{db_id}'. Skipping DB."
         )
+        output_file.write(
+            f"*** Error: Mismatched table name counts. Skipping database {db_id}. ***\\n\\n"
+        )
         return
 
     for tbl_idx, table_name_orig in enumerate(tables_orig):
@@ -226,22 +258,95 @@ def process_database(db_schema: Dict[str, Any]) -> None:
         schema_csv_str = create_schema_csv(tbl_idx, cols_orig, cols_friendly, col_types)
 
         if schema_csv_str:
-            process_table(table_name_orig, table_name_friendly, schema_csv_str)
+            process_table(
+                table_name_orig,
+                table_name_friendly,
+                schema_csv_str,
+                output_file,
+                total_tables,  # Pass total
+                processed_tables_tracker,  # Pass tracker
+            )  # Pass handle
         else:
             logging.warning(
                 f"Skipping summary generation for table '{table_name_orig}' in DB '{db_id}' due to CSV creation issues."
             )
+            output_file.write(
+                f"*** Error: Could not create schema CSV for table '{table_name_orig}'. Skipping summary generation. ***\\n\\n"
+            )
+            # Also update progress even if skipped/failed at CSV stage
+            processed_tables_tracker[0] += 1
+            current_count = processed_tables_tracker[0]
+            logging.warning(
+                f"  Progress: {current_count}/{total_tables} tables processed (CSV failed)."
+            )
+
+
+# --- Click Command Definition ---
+@click.command()
+@click.option(
+    "--input-json",
+    default=JSON_FILE_PATH,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help=f"Path to the input JSON file containing database schemas. Default: {JSON_FILE_PATH}",
+)
+@click.option(
+    "-o",
+    "--output-file",
+    required=True,
+    type=click.Path(dir_okay=False, writable=True),
+    help="Path to the output file where summaries will be written.",
+)
+@click.option(
+    "--log-level",
+    type=click.Choice(
+        ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False
+    ),
+    default="INFO",
+    help="Set the logging level.",
+)
+def main(input_json: str, output_file: str, log_level: str):
+    """
+    Generates human-readable summaries for database tables defined in a JSON file
+    and writes them to an output file.
+    """
+    # --- Reconfigure Logging based on CLI arg ---
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format="%(levelname)s: %(message)s",
+        force=True,  # Override basicConfig called earlier
+    )
+
+    logging.info("Starting table summary generation process...")
+    databases = load_database_schemas(input_json)  # Use argument
+
+    if databases:
+        # Calculate total number of tables
+        total_tables = 0
+        for db_schema in databases:
+            total_tables += len(db_schema.get("table_names_original", []))
+        logging.info(
+            f"Found {total_tables} tables to process across {len(databases)} databases."
+        )
+
+        processed_tables_tracker = [0]  # List to pass counter by reference
+
+        try:
+            # Open the output file
+            with open(output_file, "w", encoding="utf-8") as outfile:
+                logging.info(f"Writing summaries to: {output_file}")
+                for db_schema in databases:
+                    process_database(
+                        db_schema, outfile, total_tables, processed_tables_tracker
+                    )  # Pass counter and total
+                logging.info("Table summary generation process finished.")
+        except IOError as e:
+            logging.error(f"Could not open or write to output file {output_file}: {e}")
+            exit(1)  # Exit if file cannot be opened/written
+    else:
+        logging.error(f"Could not load database schemas from {input_json}. Exiting.")
+        exit(1)
 
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    logging.info("Starting table summary generation process...")
-    databases = load_database_schemas(JSON_FILE_PATH)
-
-    if databases:
-        for db_schema in databases:
-            process_database(db_schema)
-        logging.info("Table summary generation process finished.")
-    else:
-        logging.error("Could not load database schemas. Exiting.")
-        exit(1)
+    main()  # Call the click-decorated main function
