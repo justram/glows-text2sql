@@ -1,0 +1,19 @@
+[project]
+name = "text2sql-workshop" # Adjusted name
+version = "0.1.0"
+description = "Workshop materials for text-to-SQL generation"
+readme = "README.md" # Assuming a README might exist or be added later
+requires-python = ">=3.11" # Keeping python requirement from example
+dependencies = [
+    "ollama",
+    "langchain-ollama",
+    "llama-index-llms-ollama",
+    "instructor",
+    "openai",
+    "pydantic",
+    "ipykernel>=6.29.5", # Added from user example, might be useful
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta" 
