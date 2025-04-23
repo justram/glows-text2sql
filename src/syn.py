@@ -1,6 +1,7 @@
 import csv
 import json
 import logging  # Added logging
+import os  # Added os import
 from io import StringIO
 from typing import Any, Dict, List, Optional, TextIO  # Added typing, TextIO, cast
 
@@ -194,7 +195,7 @@ def process_table(
     table_name_orig: str,
     table_name_friendly: str,
     schema_csv: str,
-    output_file: TextIO,  # Output file handle (for JSONL)
+    output_file: TextIO,  # Output file handle (for the specific DB's JSONL)
     total_tables: int,  # Add total table count
     processed_tables_tracker: List[int],  # Add tracker
 ) -> Dict[str, Any]:  # Modified return type
@@ -244,11 +245,16 @@ def process_table(
     # Common actions (write to file, update progress, return)
     try:
         json_line = json.dumps(output_record)
-        output_file.write(json_line + "\\n")
+        output_file.write(json_line + "\n")
     except (TypeError, OverflowError) as json_err:
         logging.error(
             f"    Failed to serialize record to JSON for table {table_name_orig}: {json_err}"
         )
+        # Ensure the error doesn't prevent progress update or return
+        if status == "Success":  # If JSON failed, update status
+            status = "Failure"
+            details = f"Failed to serialize JSON: {json_err}"
+            output_record["error"] = details  # Add serialization error info
 
     processed_tables_tracker[0] += 1
     current_count = processed_tables_tracker[0]
@@ -264,13 +270,17 @@ def process_table(
 
 def process_database(
     db_schema: Dict[str, Any],
-    output_file: TextIO,
+    output_dir: str,  # Changed from output_file to output_dir
     total_tables: int,  # Add total table count
     processed_tables_tracker: List[int],  # Add tracker
 ) -> List[Dict[str, Any]]:  # Modified return type
-    """Processes all tables within a single database schema."""
-    db_id = db_schema.get("db_id", "Unknown DB")
+    """Processes all tables within a single database schema, writing to a DB-specific file."""
+    db_id = db_schema.get("db_id", "Unknown_DB")  # Use Unknown_DB if missing
     logging.info(f"--- Processing Database: {db_id} ---")
+
+    # Construct DB-specific output file path
+    output_filename = os.path.join(output_dir, f"{db_id}.jsonl")
+    logging.info(f"  Output file for this DB: {output_filename}")
 
     tables_orig = db_schema.get("table_names_original", [])
     tables_friendly = db_schema.get("table_names", [])
@@ -284,44 +294,93 @@ def process_database(
         )
         return []
 
-    results = []  # List to store results for this DB
-    for tbl_idx, table_name_orig in enumerate(tables_orig):
-        table_name_friendly = tables_friendly[tbl_idx]
+    results = []  # List to store results for this DB's summary table
 
-        schema_csv_str = create_schema_csv(tbl_idx, cols_orig, cols_friendly, col_types)
+    try:
+        # Open the DB-specific output file for writing
+        with open(output_filename, "w", encoding="utf-8") as db_outfile:
+            for tbl_idx, table_name_orig in enumerate(tables_orig):
+                table_name_friendly = tables_friendly[tbl_idx]
 
-        if schema_csv_str:
-            result = process_table(
-                db_id,  # Pass db_id
-                table_name_orig,
-                table_name_friendly,
-                schema_csv_str,
-                output_file,
-                total_tables,  # Pass total
-                processed_tables_tracker,  # Pass tracker
-            )  # Pass handle
-            results.append(result)  # Collect result
-        else:
-            logging.warning(
-                f"Skipping summary generation for table '{table_name_orig}' in DB '{db_id}' due to CSV creation issues."
-            )
-            # Add error result for skipped table
-            results.append(
-                {
-                    "db_id": db_id,
-                    "table_name": table_name_orig,
-                    "status": "Failure",
-                    "details": f"Could not create schema CSV for table '{table_name_orig}'.",
-                }
-            )
-            # Also update progress even if skipped/failed at CSV stage
-            processed_tables_tracker[0] += 1
-            current_count = processed_tables_tracker[0]
-            logging.warning(
-                f"  Progress: {current_count}/{total_tables} tables processed (CSV failed)."
-            )
+                schema_csv_str = create_schema_csv(
+                    tbl_idx, cols_orig, cols_friendly, col_types
+                )
 
-    return results  # Return results for this DB
+                if schema_csv_str:
+                    result = process_table(
+                        db_id,
+                        table_name_orig,
+                        table_name_friendly,
+                        schema_csv_str,
+                        db_outfile,  # Pass the DB-specific file handle
+                        total_tables,
+                        processed_tables_tracker,
+                    )
+                    results.append(result)
+                else:
+                    logging.warning(
+                        f"Skipping summary generation for table '{table_name_orig}' in DB '{db_id}' due to CSV creation issues."
+                    )
+                    # Add error result for skipped table
+                    skipped_result = {
+                        "db_id": db_id,
+                        "table_name": table_name_orig,
+                        "status": "Failure",
+                        "details": f"Could not create schema CSV for table '{table_name_orig}'.",
+                    }
+                    results.append(skipped_result)
+                    # Update progress even if skipped/failed at CSV stage
+                    processed_tables_tracker[0] += 1
+                    current_count = processed_tables_tracker[0]
+                    logging.warning(
+                        f"  Progress: {current_count}/{total_tables} tables processed (CSV failed)."
+                    )
+                    # Optionally write the failure to the file too
+                    try:
+                        failure_record = {
+                            "db_id": db_id,
+                            "table_name_original": table_name_orig,
+                            "table_name_friendly": tables_friendly[tbl_idx]
+                            if tbl_idx < len(tables_friendly)
+                            else "Unknown",
+                            "schema_csv": None,
+                            "summary": None,
+                            "error": skipped_result["details"],
+                            "model_name": OLLAMA_MODEL,
+                            "endpoint_type": ENDPOINT_TYPE,
+                        }
+                        json_line = json.dumps(failure_record)
+                        db_outfile.write(json_line + "\n")
+                    except Exception as write_err:
+                        logging.error(
+                            f"    Failed to write skipped table record for {table_name_orig}: {write_err}"
+                        )
+
+    except IOError as e:
+        logging.error(f"Could not open or write to output file {output_filename}: {e}")
+        # If we can't write the file, we can't process tables for this DB.
+        # Update progress for all tables in this DB as failed.
+        num_tables_in_db = len(tables_orig)
+        processed_tables_tracker[0] += num_tables_in_db
+        current_count = processed_tables_tracker[0]
+        logging.error(
+            f"Skipping all {num_tables_in_db} tables in DB {db_id} due to file error."
+        )
+        logging.warning(
+            f"  Progress: {current_count}/{total_tables} tables processed (DB skipped)."
+        )
+        # Return failure results for the summary table
+        results = [
+            {
+                "db_id": db_id,
+                "table_name": t_name,
+                "status": "Failure",
+                "details": f"Could not open/write output file {output_filename}",
+            }
+            for t_name in tables_orig
+        ]
+
+    return results  # Return results for this DB's summary table
 
 
 # --- Click Command Definition ---
@@ -334,10 +393,12 @@ def process_database(
 )
 @click.option(
     "-o",
-    "--output-file",
+    "--output-dir",  # Changed from --output-file
     required=True,
-    type=click.Path(dir_okay=False, writable=True),
-    help="Path to the output JSONL file where summaries will be written.",
+    type=click.Path(
+        file_okay=False, dir_okay=True, writable=True
+    ),  # Ensure it's a directory
+    help="Path to the output directory where DB-specific JSONL files will be written.",
 )
 @click.option(
     "--log-level",
@@ -347,10 +408,11 @@ def process_database(
     default="INFO",
     help="Set the logging level.",
 )
-def main(input_json: str, output_file: str, log_level: str):
+def main(input_json: str, output_dir: str, log_level: str):  # Updated signature
     """
     Generates human-readable summaries for database tables defined in a JSON file
-    and writes them to an output file. Displays a summary table at the end.
+    and writes them to DB-specific JSONL files in the specified output directory.
+    Displays a summary table after processing each database.
     """
     # --- Reconfigure Logging based on CLI arg ---
     logging.basicConfig(
@@ -360,6 +422,17 @@ def main(input_json: str, output_file: str, log_level: str):
     )
 
     logging.info("Starting table summary generation process...")
+    logging.info(f"Input JSON: {input_json}")
+    logging.info(f"Output Directory: {output_dir}")  # Log output dir
+
+    # --- Create Output Directory ---
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        logging.info(f"Output directory '{output_dir}' ensured.")
+    except OSError as e:
+        logging.error(f"Could not create output directory '{output_dir}': {e}")
+        exit(1)
+
     databases = load_database_schemas(input_json)  # Use argument
 
     if databases:
@@ -372,80 +445,62 @@ def main(input_json: str, output_file: str, log_level: str):
         )
 
         processed_tables_tracker = [0]  # List to pass counter by reference
-        all_results = []  # List to store all results
 
         try:
-            # Open the output file
-            with open(output_file, "w", encoding="utf-8") as outfile:
-                logging.info(f"Writing summaries to: {output_file}")
-                for db_schema in databases:
-                    db_results = process_database(
-                        db_schema, outfile, total_tables, processed_tables_tracker
-                    )  # Pass counter and total
-                    all_results.extend(db_results)  # Collect results
-
-                    # --- Print Summary Table for the Current DB ---
-                    if db_results:
-                        db_id = db_schema.get(
-                            "db_id", "Unknown DB"
-                        )  # Get DB ID for title
-                        console = Console()
-                        table = Table(
-                            show_header=True,
-                            header_style="bold cyan",  # Slightly different style for intermediate tables
-                            title=f"Processing Summary for DB: {db_id}",
-                        )
-                        table.add_column("Table Name", min_width=20)
-                        table.add_column("Status", justify="center")
-                        table.add_column("Details / Summary Snippet", max_width=80)
-
-                        for result in db_results:
-                            status_style = (
-                                "green" if result["status"] == "Success" else "red"
-                            )
-                            table.add_row(
-                                result["table_name"],
-                                f"[{status_style}]{result['status']}[/]",
-                                result["details"] or "N/A",
-                            )
-                        console.print(table)
-                    # --- End Intermediate Table Print ---
-
-                logging.info("Table summary generation process finished.")
-
-            # --- Print Final Summary Table ---
-            if all_results:
-                console = Console()
-                table = Table(
-                    show_header=True,
-                    header_style="bold magenta",
-                    title="Processing Summary",
+            # Loop through databases, process each, and handle its output file internally
+            logging.info(f"Processing databases and writing to: {output_dir}")
+            for db_schema in databases:
+                db_results = process_database(
+                    db_schema,
+                    output_dir,
+                    total_tables,
+                    processed_tables_tracker,  # Pass output_dir
                 )
-                table.add_column("DB ID", style="dim", width=15)
-                table.add_column("Table Name", min_width=20)
-                table.add_column("Status", justify="center")
-                table.add_column("Details / Summary Snippet", max_width=80)
+                # Removed collecting results into all_results
 
-                for result in all_results:
-                    status_style = "green" if result["status"] == "Success" else "red"
-                    table.add_row(
-                        result["db_id"],
-                        result["table_name"],
-                        f"[{status_style}]{result['status']}[/]",
-                        result["details"]
-                        or "N/A",  # Handle cases where details might be None
+                # --- Print Summary Table for the Current DB ---
+                if db_results:
+                    db_id = db_schema.get("db_id", "Unknown DB")  # Get DB ID for title
+                    console = Console()
+                    table = Table(
+                        show_header=True,
+                        header_style="bold cyan",
+                        title=f"Processing Summary for DB: {db_id}",
+                        title_justify="left",  # Align title left
+                        caption=f"Output saved to {os.path.join(output_dir, f'{db_id}.jsonl')}",  # Add caption
                     )
+                    table.add_column("Table Name", min_width=20)
+                    table.add_column("Status", justify="center")
+                    table.add_column("Details / Summary Snippet", max_width=80)
 
-                console.print(table)
-                logging.info(
-                    "Final processing summary table displayed."
-                )  # Added log message
-            else:
-                logging.info("No tables were processed or found.")
+                    for result in db_results:
+                        status_style = (
+                            "green" if result["status"] == "Success" else "red"
+                        )
+                        table.add_row(
+                            result["table_name"],
+                            f"[{status_style}]{result['status']}[/]",
+                            result["details"] or "N/A",
+                        )
+                    console.print(table)
+                    console.print()  # Add a blank line for separation
 
-        except IOError as e:
-            logging.error(f"Could not open or write to output file {output_file}: {e}")
-            exit(1)  # Exit if file cannot be opened/written
+            logging.info("Table summary generation process finished.")
+
+            # --- Removed Final Summary Table ---
+            logging.info(
+                f"Processing complete. Output files are located in '{output_dir}'."
+            )
+
+        except (
+            Exception
+        ) as e:  # Catch potential unexpected errors during processing loop
+            logging.error(
+                f"An unexpected error occurred during database processing: {e}",
+                exc_info=True,
+            )
+            exit(1)  # Exit if a major error happens during the loop
+
     else:
         logging.error(f"Could not load database schemas from {input_json}. Exiting.")
         exit(1)
