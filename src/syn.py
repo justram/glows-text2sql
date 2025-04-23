@@ -383,9 +383,37 @@ def main(input_json: str, output_file: str, log_level: str):
                         db_schema, outfile, total_tables, processed_tables_tracker
                     )  # Pass counter and total
                     all_results.extend(db_results)  # Collect results
+
+                    # --- Print Summary Table for the Current DB ---
+                    if db_results:
+                        db_id = db_schema.get(
+                            "db_id", "Unknown DB"
+                        )  # Get DB ID for title
+                        console = Console()
+                        table = Table(
+                            show_header=True,
+                            header_style="bold cyan",  # Slightly different style for intermediate tables
+                            title=f"Processing Summary for DB: {db_id}",
+                        )
+                        table.add_column("Table Name", min_width=20)
+                        table.add_column("Status", justify="center")
+                        table.add_column("Details / Summary Snippet", max_width=80)
+
+                        for result in db_results:
+                            status_style = (
+                                "green" if result["status"] == "Success" else "red"
+                            )
+                            table.add_row(
+                                result["table_name"],
+                                f"[{status_style}]{result['status']}[/]",
+                                result["details"] or "N/A",
+                            )
+                        console.print(table)
+                    # --- End Intermediate Table Print ---
+
                 logging.info("Table summary generation process finished.")
 
-            # --- Print Summary Table ---
+            # --- Print Final Summary Table ---
             if all_results:
                 console = Console()
                 table = Table(
@@ -409,6 +437,9 @@ def main(input_json: str, output_file: str, log_level: str):
                     )
 
                 console.print(table)
+                logging.info(
+                    "Final processing summary table displayed."
+                )  # Added log message
             else:
                 logging.info("No tables were processed or found.")
 
