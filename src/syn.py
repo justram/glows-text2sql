@@ -8,6 +8,8 @@ import click  # Import click
 import instructor
 import openai
 from pydantic import BaseModel, Field
+from rich.console import Console  # Added rich import
+from rich.table import Table  # Added rich import
 
 # --- Configuration ---
 JSON_FILE_PATH = "data/dev_20240627/dev_tables.json"
@@ -195,8 +197,8 @@ def process_table(
     output_file: TextIO,  # Output file handle (for JSONL)
     total_tables: int,  # Add total table count
     processed_tables_tracker: List[int],  # Add tracker
-) -> None:
-    """Processes a single table: creates input, calls LLM, writes JSON line, and updates progress."""
+) -> Dict[str, Any]:  # Modified return type
+    """Processes a single table: creates input, calls LLM, writes JSON line, updates progress, and returns status."""
     logging.info(
         f"  Generating summary for table: {table_name_orig} ({table_name_friendly}) in DB: {db_id}"
     )
@@ -220,16 +222,26 @@ def process_table(
 
     summary_output = get_table_summary(table_input)
     if summary_output:
+        # Actions for success
         output_record["summary"] = summary_output.summary
         logging.info(
-            f"    Successfully generated and wrote summary for {table_name_orig}."
+            f"    Successfully generated summary for {table_name_orig}."
+        )  # Simplified log slightly
+        status = "Success"
+        details = (
+            output_record["summary"][:75] + "..."
+            if output_record["summary"] and len(output_record["summary"]) > 75
+            else output_record["summary"]
         )
     else:
+        # Actions for failure
         error_msg = f"Failed to generate summary for table {table_name_orig}."
         output_record["error"] = error_msg
         logging.error(f"    {error_msg}")
+        status = "Failure"
+        details = error_msg
 
-    # Write the JSON line to the output file
+    # Common actions (write to file, update progress, return)
     try:
         json_line = json.dumps(output_record)
         output_file.write(json_line + "\\n")
@@ -238,10 +250,16 @@ def process_table(
             f"    Failed to serialize record to JSON for table {table_name_orig}: {json_err}"
         )
 
-    # Update progress counter and log status
     processed_tables_tracker[0] += 1
     current_count = processed_tables_tracker[0]
     logging.info(f"  Progress: {current_count}/{total_tables} tables processed.")
+
+    return {
+        "db_id": db_id,
+        "table_name": table_name_orig,
+        "status": status,
+        "details": details,
+    }
 
 
 def process_database(
@@ -249,7 +267,7 @@ def process_database(
     output_file: TextIO,
     total_tables: int,  # Add total table count
     processed_tables_tracker: List[int],  # Add tracker
-) -> None:  # Add output file handle
+) -> List[Dict[str, Any]]:  # Modified return type
     """Processes all tables within a single database schema."""
     db_id = db_schema.get("db_id", "Unknown DB")
     logging.info(f"--- Processing Database: {db_id} ---")
@@ -264,15 +282,16 @@ def process_database(
         logging.warning(
             f"Mismatch between original ({len(tables_orig)}) and friendly ({len(tables_friendly)}) table name counts for DB '{db_id}'. Skipping DB."
         )
-        return
+        return []
 
+    results = []  # List to store results for this DB
     for tbl_idx, table_name_orig in enumerate(tables_orig):
         table_name_friendly = tables_friendly[tbl_idx]
 
         schema_csv_str = create_schema_csv(tbl_idx, cols_orig, cols_friendly, col_types)
 
         if schema_csv_str:
-            process_table(
+            result = process_table(
                 db_id,  # Pass db_id
                 table_name_orig,
                 table_name_friendly,
@@ -281,35 +300,28 @@ def process_database(
                 total_tables,  # Pass total
                 processed_tables_tracker,  # Pass tracker
             )  # Pass handle
+            results.append(result)  # Collect result
         else:
             logging.warning(
                 f"Skipping summary generation for table '{table_name_orig}' in DB '{db_id}' due to CSV creation issues."
             )
-            # Write a specific error record for this table
-            error_record = {
-                "db_id": db_id,
-                "table_name_original": table_name_orig,
-                "table_name_friendly": table_name_friendly,
-                "schema_csv": None,
-                "summary": None,
-                "error": f"Could not create schema CSV for table '{table_name_orig}'. Skipping summary generation.",
-                "model_name": OLLAMA_MODEL,
-                "endpoint_type": ENDPOINT_TYPE,
-            }
-            try:
-                json_line = json.dumps(error_record)
-                output_file.write(json_line + "\\n")
-            except (TypeError, OverflowError) as json_err:
-                logging.error(
-                    f"    Failed to serialize CSV error record to JSON for table {table_name_orig}: {json_err}"
-                )
-
+            # Add error result for skipped table
+            results.append(
+                {
+                    "db_id": db_id,
+                    "table_name": table_name_orig,
+                    "status": "Failure",
+                    "details": f"Could not create schema CSV for table '{table_name_orig}'.",
+                }
+            )
             # Also update progress even if skipped/failed at CSV stage
             processed_tables_tracker[0] += 1
             current_count = processed_tables_tracker[0]
             logging.warning(
                 f"  Progress: {current_count}/{total_tables} tables processed (CSV failed)."
             )
+
+    return results  # Return results for this DB
 
 
 # --- Click Command Definition ---
@@ -338,7 +350,7 @@ def process_database(
 def main(input_json: str, output_file: str, log_level: str):
     """
     Generates human-readable summaries for database tables defined in a JSON file
-    and writes them to an output file.
+    and writes them to an output file. Displays a summary table at the end.
     """
     # --- Reconfigure Logging based on CLI arg ---
     logging.basicConfig(
@@ -360,16 +372,46 @@ def main(input_json: str, output_file: str, log_level: str):
         )
 
         processed_tables_tracker = [0]  # List to pass counter by reference
+        all_results = []  # List to store all results
 
         try:
             # Open the output file
             with open(output_file, "w", encoding="utf-8") as outfile:
                 logging.info(f"Writing summaries to: {output_file}")
                 for db_schema in databases:
-                    process_database(
+                    db_results = process_database(
                         db_schema, outfile, total_tables, processed_tables_tracker
                     )  # Pass counter and total
+                    all_results.extend(db_results)  # Collect results
                 logging.info("Table summary generation process finished.")
+
+            # --- Print Summary Table ---
+            if all_results:
+                console = Console()
+                table = Table(
+                    show_header=True,
+                    header_style="bold magenta",
+                    title="Processing Summary",
+                )
+                table.add_column("DB ID", style="dim", width=15)
+                table.add_column("Table Name", min_width=20)
+                table.add_column("Status", justify="center")
+                table.add_column("Details / Summary Snippet", max_width=80)
+
+                for result in all_results:
+                    status_style = "green" if result["status"] == "Success" else "red"
+                    table.add_row(
+                        result["db_id"],
+                        result["table_name"],
+                        f"[{status_style}]{result['status']}[/]",
+                        result["details"]
+                        or "N/A",  # Handle cases where details might be None
+                    )
+
+                console.print(table)
+            else:
+                logging.info("No tables were processed or found.")
+
         except IOError as e:
             logging.error(f"Could not open or write to output file {output_file}: {e}")
             exit(1)  # Exit if file cannot be opened/written
